@@ -31,7 +31,7 @@ pub fn find_conflict_slow(
 ) -> eyre::Result<HashMap<(OrderId, OrderId), Conflict>> {
     let mut state_provider = Arc::<dyn StateProvider>::from(state_provider);
     let profits_alone = {
-        let mut profits_alone = HashMap::new();
+        let mut profits_alone = HashMap::with_capacity(orders.len());
         for order in orders {
             let mut state = BlockState::new_arc(state_provider);
             let mut fork = PartialBlockFork::new(&mut state);
@@ -120,13 +120,12 @@ pub fn get_conflict_sets(
             continue;
         }
 
-        let set1id = order_to_conflict_set.get(k1).cloned();
-        let set2id = order_to_conflict_set.get(k2).cloned();
-        match (set1id, set2id) {
-            (Some(set1id), Some(set2id)) => {
-                if set1id == set2id {
-                    continue;
-                }
+        let set1id = order_to_conflict_set.get(k1).copied();
+        let set2id = order_to_conflict_set.get(k2).copied();
+        match (conflict, set1id, set2id) {
+            (Conflict::NoConflict, _, _) => continue,
+            (_, Some(set1id), Some(set2id)) if set1id == set2id => continue,
+            (_, Some(set1id), Some(set2id)) => {
                 // mesge two conflic sets
                 let mut set1 = conflict_sets.remove(&set1id).unwrap();
                 let set2 = conflict_sets.remove(&set2id).unwrap();
@@ -136,14 +135,14 @@ pub fn get_conflict_sets(
                 }
                 conflict_sets.insert(set1id, set1);
             }
-            (Some(set_id), None) | (None, Some(set_id)) => {
+            (_, Some(set_id), None) | (_, None, Some(set_id)) => {
                 let set = conflict_sets.get_mut(&set_id).unwrap();
                 set.insert(*k1);
                 set.insert(*k2);
                 order_to_conflict_set.insert(*k1, set_id);
                 order_to_conflict_set.insert(*k2, set_id);
             }
-            (None, None) => {
+            (_, None, None) => {
                 let mut set = HashSet::new();
                 set.insert(*k1);
                 set.insert(*k2);
@@ -155,7 +154,6 @@ pub fn get_conflict_sets(
         }
     }
     let mut conflict_sets = conflict_sets.into_values().collect::<Vec<_>>();
-    conflict_sets.sort_by_key(|set| set.len());
-    conflict_sets.reverse();
+    conflict_sets.sort_by_key(|set| std::cmp::Reverse(set.len()));
     conflict_sets
 }
