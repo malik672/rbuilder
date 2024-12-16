@@ -3,18 +3,17 @@ use crossbeam_queue::SegQueue;
 use eyre::Result;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use reth_provider::StateProviderFactory;
-use std::sync::mpsc as std_mpsc;
-use std::sync::Arc;
-use std::time::Instant;
+use std::{
+    sync::{mpsc as std_mpsc, Arc},
+    time::Instant,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{trace, warn};
 
-use super::conflict_task_generator::get_tasks_for_group;
-use super::ConflictResolutionResultPerGroup;
-use super::TaskPriority;
 use super::{
-    conflict_resolvers::ResolverContext, simulation_cache::SharedSimulationCache, ConflictGroup,
-    ConflictTask, GroupId, ResolutionResult,
+    conflict_resolvers::ResolverContext, conflict_task_generator::get_tasks_for_group,
+    simulation_cache::SharedSimulationCache, ConflictGroup, ConflictResolutionResultPerGroup,
+    ConflictTask, GroupId, ResolutionResult, TaskPriority,
 };
 use crate::building::BlockBuildingContext;
 
@@ -70,6 +69,9 @@ where
         self.thread_pool.spawn(move || {
             while !cancellation_token.is_cancelled() {
                 if let Some(task) = task_queue.pop() {
+                    if cancellation_token.is_cancelled() {
+                        return;
+                    }
                     let task_start = Instant::now();
                     if let Ok((task_id, result)) = Self::process_task(
                         task,
@@ -93,6 +95,7 @@ where
                                     time_taken_ms = %task_start.elapsed().as_millis(),
                                     "Conflict resolving: failed to send group result"
                                 );
+                                return;
                             }
                         }
                     }
@@ -101,7 +104,7 @@ where
         });
     }
 
-    pub fn process_task(
+    fn process_task(
         task: ConflictTask,
         ctx: &BlockBuildingContext,
         provider: &P,
@@ -111,7 +114,7 @@ where
         let mut merging_context = ResolverContext::new(
             provider.clone(),
             ctx.clone(),
-            cancellation_token,
+            cancellation_token.clone(),
             None,
             simulation_cache,
         );
@@ -131,10 +134,15 @@ where
                 Ok((task_id, (sequence_of_orders, task_group)))
             }
             Err(err) => {
-                warn!(
-                    "Error running conflict task for group_idx {}: {:?}",
-                    task_id, err
-                );
+                // Fast patch/heuristic to fix excessive tracing.
+                // TODO: Use good errors.
+                if !cancellation_token.is_cancelled() {
+                    warn!(
+                        group_id = task_id,
+                        err = ?err,
+                        "Error running conflict task for group_idx",
+                    );
+                }
                 Err(err)
             }
         }

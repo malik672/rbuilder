@@ -7,17 +7,19 @@ pub mod serialize;
 mod test_data_generator;
 
 use crate::building::evm_inspector::UsedStateTrace;
-use alloy_eips::eip4844::{Blob, Bytes48};
-use alloy_primitives::{Bytes, TxHash};
+use alloy_consensus::Transaction as _;
+use alloy_eips::{
+    eip2718::{Decodable2718, Eip2718Error, Encodable2718},
+    eip4844::{Blob, Bytes48},
+};
+use alloy_primitives::{keccak256, Address, Bytes, TxHash, B256, U256};
 use derivative::Derivative;
 use integer_encoding::VarInt;
 use reth_primitives::{
-    keccak256,
     kzg::{BYTES_PER_BLOB, BYTES_PER_COMMITMENT, BYTES_PER_PROOF},
-    Address, BlobTransactionSidecar, PooledTransactionsElement, TransactionSigned,
-    TransactionSignedEcRecovered, B256,
+    BlobTransactionSidecar, PooledTransactionsElement, TransactionSigned,
+    TransactionSignedEcRecovered,
 };
-use revm_primitives::U256;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{cmp::Ordering, collections::HashMap, fmt::Display, str::FromStr, sync::Arc};
@@ -429,11 +431,16 @@ impl std::fmt::Debug for TransactionSignedEcRecoveredWithBlobs {
 #[derive(Error, Debug)]
 pub enum RawTxWithBlobsConvertError {
     #[error("Failed to decode transaction, error: {0}")]
-    FailedToDecodeTransaction(alloy_rlp::Error),
+    FailedToDecodeTransaction(Eip2718Error),
     #[error("Invalid transaction signature")]
     InvalidTransactionSignature,
-    #[error("Invalid transaction signature")]
+    #[error("UnexpectedError")]
     UnexpectedError,
+    /// This error is generated when we fail (like FailedToDecodeTransaction) parsing in TxEncoding::WithBlobData mode (Network encoding) but the header looks
+    /// like the beginning of an ethereum mainnet Canonical encoding 4484 tx.
+    /// To avoid consuming resources the generation of this error might not be perfect but helps 99% of the time.
+    #[error("Failed to decode transaction, error: {0}. It probably is a 4484 canonical tx.")]
+    FailedToDecodeTransactionProbablyIs4484Canonical(alloy_rlp::Error),
 }
 
 impl TransactionSignedEcRecoveredWithBlobs {
@@ -467,7 +474,11 @@ impl TransactionSignedEcRecoveredWithBlobs {
     }
 
     pub fn nonce(&self) -> u64 {
-        self.tx.nonce()
+        self.tx.as_signed().nonce()
+    }
+
+    pub fn value(&self) -> U256 {
+        self.tx.as_signed().value()
     }
 
     /// USE CAREFULLY since this exposes the signed tx.
@@ -484,7 +495,9 @@ impl TransactionSignedEcRecoveredWithBlobs {
     /// I intensionally omitted the version with blob data since we don't use it and may lead to confusions/bugs.
     /// USE CAREFULLY since this exposes the signed tx.
     pub fn envelope_encoded_no_blobs(&self) -> Bytes {
-        self.tx.envelope_encoded()
+        let mut buf = Vec::new();
+        self.tx.as_signed().encode_2718(&mut buf);
+        buf.into()
     }
 
     /// Decodes the "raw" format of transaction (e.g. `eth_sendRawTransaction`) with the blob data (network format)
@@ -493,7 +506,7 @@ impl TransactionSignedEcRecoveredWithBlobs {
     ) -> Result<TransactionSignedEcRecoveredWithBlobs, RawTxWithBlobsConvertError> {
         let raw_tx = &mut raw_tx.as_ref();
         let pooled_tx: PooledTransactionsElement =
-            PooledTransactionsElement::decode_enveloped(raw_tx)
+            PooledTransactionsElement::decode_2718(raw_tx)
                 .map_err(RawTxWithBlobsConvertError::FailedToDecodeTransaction)?;
         let signer = pooled_tx
             .recover_signer()
@@ -545,7 +558,7 @@ impl TransactionSignedEcRecoveredWithBlobs {
     pub fn decode_enveloped_with_fake_blobs(
         raw_tx: Bytes,
     ) -> Result<TransactionSignedEcRecoveredWithBlobs, RawTxWithBlobsConvertError> {
-        let decoded = TransactionSigned::decode_enveloped(&mut raw_tx.as_ref())
+        let decoded = TransactionSigned::decode_2718(&mut raw_tx.as_ref())
             .map_err(RawTxWithBlobsConvertError::FailedToDecodeTransaction)?;
         let tx = decoded
             .into_ecrecovered()
@@ -928,8 +941,9 @@ fn can_execute_with_block_base_fee<Transaction: AsRef<TransactionSigned>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::TxLegacy;
     use alloy_primitives::fixed_bytes;
-    use reth_primitives::{Transaction, TransactionSigned, TxLegacy};
+    use reth_primitives::{Transaction, TransactionSigned};
     use uuid::uuid;
 
     #[test]

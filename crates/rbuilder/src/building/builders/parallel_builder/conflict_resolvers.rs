@@ -3,19 +3,21 @@ use alloy_primitives::{Address, U256};
 use eyre::Result;
 use itertools::Itertools;
 use rand::{seq::SliceRandom, SeedableRng};
-use reth::providers::StateProvider;
-use reth_payload_builder::database::CachedReads;
+use reth::{providers::StateProvider, revm::cached::CachedReads};
 use reth_provider::StateProviderFactory;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::trace;
 
-use super::simulation_cache::{CachedSimulationState, SharedSimulationCache};
-use super::{Algorithm, ConflictTask, ResolutionResult};
+use super::{
+    simulation_cache::{CachedSimulationState, SharedSimulationCache},
+    Algorithm, ConflictTask, ResolutionResult,
+};
 
-use crate::building::{BlockBuildingContext, BlockState, PartialBlock};
-use crate::building::{ExecutionError, ExecutionResult};
-use crate::primitives::{OrderId, SimulatedOrder};
+use crate::{
+    building::{BlockBuildingContext, BlockState, ExecutionError, ExecutionResult, PartialBlock},
+    primitives::{OrderId, SimulatedOrder},
+};
 
 /// Context for resolving conflicts in merging tasks.
 #[derive(Debug)]
@@ -462,12 +464,10 @@ mod tests {
     use std::time::Instant;
 
     use ahash::HashSet;
-    use uuid::Uuid;
-
+    use alloy_consensus::TxLegacy;
     use alloy_primitives::{Address, TxHash, B256, U256};
-    use reth::primitives::{
-        Transaction, TransactionSigned, TransactionSignedEcRecovered, TxLegacy,
-    };
+    use reth::primitives::{Transaction, TransactionSigned, TransactionSignedEcRecovered};
+    use uuid::Uuid;
 
     use super::*;
     use crate::{

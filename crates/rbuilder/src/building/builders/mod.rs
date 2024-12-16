@@ -12,19 +12,19 @@ use crate::{
     utils::{is_provider_factory_health_error, NonceCache},
 };
 use ahash::HashSet;
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, Bytes, B256};
 use block_building_helper::BlockBuildingHelper;
 use reth::{
     primitives::{BlobTransactionSidecar, SealedBlock},
-    tasks::pool::BlockingTaskPool,
+    revm::cached::CachedReads,
 };
 use reth_db::Database;
-use reth_payload_builder::database::CachedReads;
+use reth_errors::ProviderError;
 use reth_provider::{DatabaseProviderFactory, StateProviderFactory};
 use std::{fmt::Debug, marker::PhantomData, sync::Arc};
 use tokio::sync::{broadcast, broadcast::error::TryRecvError};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, warn};
+use tracing::{info, warn};
 
 /// Block we built
 #[derive(Debug, Clone)]
@@ -33,6 +33,8 @@ pub struct Block {
     pub sealed_block: SealedBlock,
     /// Sidecars for the txs included in SealedBlock
     pub txs_blobs_sidecars: Vec<Arc<BlobTransactionSidecar>>,
+    /// The Pectra execution requests for this bid.
+    pub execution_requests: Vec<Bytes>,
     pub builder_name: String,
 }
 
@@ -40,7 +42,6 @@ pub struct Block {
 pub struct LiveBuilderInput<P, DB> {
     pub provider: P,
     pub root_hash_config: RootHashConfig,
-    pub root_hash_task_pool: BlockingTaskPool,
     pub ctx: BlockBuildingContext,
     pub input: broadcast::Receiver<SimulatedOrderCommand>,
     pub sink: Arc<dyn UnfinishedBlockBuildingSink>,
@@ -141,8 +142,12 @@ where
 
     /// Returns true if success, on false builder should stop
     pub fn consume_next_batch(&mut self) -> eyre::Result<bool> {
-        self.order_consumer.consume_next_commands()?;
-        self.update_onchain_nonces()?;
+        if !self.order_consumer.consume_next_commands()? {
+            return Ok(false);
+        }
+        if !self.update_onchain_nonces()? {
+            return Ok(false);
+        }
 
         self.order_consumer
             .apply_new_commands(&mut self.block_orders);
@@ -159,7 +164,11 @@ where
                 SimulatedOrderCommand::Simulation(sim_order) => Some(sim_order),
                 SimulatedOrderCommand::Cancellation(_) => None,
             });
-        let nonce_db_ref = self.nonce_cache.get_ref()?;
+        let nonce_db_ref = match self.nonce_cache.get_ref() {
+            Ok(nonce_db_ref) => nonce_db_ref,
+            Err(ProviderError::BlockHashNotFound(_)) => return Ok(false), // This can happen on reorgs since the block is removed
+            Err(err) => return Err(err.into()),
+        };
         let mut nonces = Vec::new();
         for new_order in new_orders {
             for nonce in new_order.order.nonces() {
@@ -215,7 +224,7 @@ pub struct BlockBuildingAlgorithmInput<P> {
 pub trait BlockBuildingAlgorithm<P, DB>: Debug + Send + Sync
 where
     DB: Database + Clone + 'static,
-    P: DatabaseProviderFactory<DB> + StateProviderFactory + Clone + 'static,
+    P: DatabaseProviderFactory<DB = DB> + StateProviderFactory + Clone + 'static,
 {
     fn name(&self) -> String;
     fn build_blocks(&self, input: BlockBuildingAlgorithmInput<P>);
@@ -249,7 +258,7 @@ pub fn handle_building_error(err: eyre::Report) -> bool {
     let err_str = err.to_string();
     if !err_str.contains("Profit too low") {
         if is_provider_factory_health_error(&err) {
-            error!(?err, "Cancelling building due to provider factory error");
+            info!(?err, "Cancelling building due to provider factory error");
             return false;
         } else {
             warn!(?err, "Error filling orders");

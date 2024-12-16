@@ -31,21 +31,45 @@ use payload_events::MevBoostSlotData;
 use reth::{primitives::Header, providers::HeaderProvider};
 use reth_chainspec::ChainSpec;
 use reth_db::Database;
-use reth_provider::{DatabaseProviderFactory, StateProviderFactory};
-use std::fmt::Debug;
-use std::{cmp::min, path::PathBuf, sync::Arc, time::Duration};
+use reth_provider::{BlockReader, DatabaseProviderFactory, StateProviderFactory};
+use std::{cmp::min, fmt::Debug, path::PathBuf, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-/// Time the proposer have to propose a block from the beginning of the slot (https://www.paradigm.xyz/2023/04/mev-boost-ethereum-consensus Slot anatomy)
-const SLOT_PROPOSAL_DURATION: std::time::Duration = Duration::from_secs(4);
-/// Delta from slot time to get_header dead line. If we can't get the block header before slot_time + BLOCK_HEADER_DEAD_LINE_DELTA we cancel the slot.
-/// Careful: It's signed and usually negative since we need de header BEFORE the slot time.
-const BLOCK_HEADER_DEAD_LINE_DELTA: time::Duration = time::Duration::milliseconds(-2500);
-/// Polling period while trying to get a block header
-const GET_BLOCK_HEADER_PERIOD: time::Duration = time::Duration::milliseconds(250);
+#[derive(Debug, Clone)]
+pub struct TimingsConfig {
+    /// Time the proposer have to propose a block from the beginning of the
+    /// slot (https://www.paradigm.xyz/2023/04/mev-boost-ethereum-consensus Slot anatomy)
+    pub slot_proposal_duration: Duration,
+    /// Delta from slot time to get_header dead line. If we can't get the block header
+    /// before slot_time + BLOCK_HEADER_DEAD_LINE_DELTA we cancel the slot.
+    /// Careful: It's signed and usually negative since we need de header BEFORE the slot time.
+    pub block_header_deadline_delta: time::Duration,
+    /// Polling period while trying to get a block header
+    pub get_block_header_period: time::Duration,
+}
+
+impl TimingsConfig {
+    /// Classic rbuilder
+    pub fn ethereum() -> Self {
+        Self {
+            slot_proposal_duration: Duration::from_secs(4),
+            block_header_deadline_delta: time::Duration::milliseconds(-2500),
+            get_block_header_period: time::Duration::milliseconds(250),
+        }
+    }
+
+    /// Configuration for OP-based chains with fast block times
+    pub fn optimism() -> Self {
+        Self {
+            slot_proposal_duration: Duration::from_secs(0),
+            block_header_deadline_delta: time::Duration::milliseconds(-25),
+            get_block_header_period: time::Duration::milliseconds(25),
+        }
+    }
+}
 
 /// Trait used to trigger a new block building process in the slot.
 pub trait SlotSource {
@@ -63,7 +87,7 @@ where
     P: StateProviderFactory + Clone,
     BlocksSourceType: SlotSource,
 {
-    pub watchdog_timeout: Duration,
+    pub watchdog_timeout: Option<Duration>,
     pub error_storage_path: Option<PathBuf>,
     pub simulation_threads: usize,
     pub order_input_config: OrderInputConfig,
@@ -91,7 +115,11 @@ where
 impl<P, DB, BlocksSourceType: SlotSource> LiveBuilder<P, DB, BlocksSourceType>
 where
     DB: Database + Clone + 'static,
-    P: DatabaseProviderFactory<DB> + StateProviderFactory + HeaderProvider + Clone + 'static,
+    P: DatabaseProviderFactory<DB = DB, Provider: BlockReader>
+        + StateProviderFactory
+        + HeaderProvider
+        + Clone
+        + 'static,
     BlocksSourceType: SlotSource,
 {
     pub fn with_extra_rpc(self, extra_rpc: RpcModule<()>) -> Self {
@@ -103,11 +131,14 @@ where
     }
 
     pub async fn run(self) -> eyre::Result<()> {
+        // We keep the last block to avoid going back in time since we are now very robust about reorgs or this kind of behavior.
+        let mut last_processed_block: Option<u64> = None;
         info!("Builder block list size: {}", self.blocklist.len(),);
         info!(
             "Builder coinbase address: {:?}",
             self.coinbase_signer.address
         );
+        let timings = self.timings();
 
         if let Some(error_storage_path) = self.error_storage_path {
             spawn_error_storage_writer(error_storage_path, self.global_cancellation.clone())
@@ -149,7 +180,16 @@ where
             self.run_sparse_trie_prefetcher,
         );
 
-        let watchdog_sender = spawn_watchdog_thread(self.watchdog_timeout)?;
+        let watchdog_sender = match self.watchdog_timeout {
+            Some(duration) => Some(spawn_watchdog_thread(
+                duration,
+                "block build started".to_string(),
+            )?),
+            None => {
+                info!("Watchdog not enabled");
+                None
+            }
+        };
 
         while let Some(payload) = payload_events_channel.recv().await {
             if self.blocklist.contains(&payload.fee_recipient()) {
@@ -160,17 +200,25 @@ where
                 );
                 continue;
             }
+            // Allow only increasing blocks
+            if last_processed_block.map_or(false, |last_processed_block| {
+                payload.block() <= last_processed_block
+            }) {
+                continue;
+            }
+            let current_time = OffsetDateTime::now_utc();
             // see if we can get parent header in a reasonable time
-
-            let time_to_slot = payload.timestamp() - OffsetDateTime::now_utc();
+            let time_to_slot = payload.timestamp() - current_time;
             debug!(
                 slot = payload.slot(),
                 block = payload.block(),
+                ?current_time,
+                payload_timestamp = ?payload.timestamp(),
                 ?time_to_slot,
                 "Received payload, time till slot timestamp",
             );
 
-            let time_until_slot_end = time_to_slot + SLOT_PROPOSAL_DURATION;
+            let time_until_slot_end = time_to_slot + timings.slot_proposal_duration;
             if time_until_slot_end.is_negative() {
                 warn!(
                     slot = payload.slot(),
@@ -183,7 +231,8 @@ where
                 // @Nicer
                 let parent_block = payload.parent_block_hash();
                 let timestamp = payload.timestamp();
-                match wait_for_block_header(parent_block, timestamp, &self.provider).await {
+                match wait_for_block_header(parent_block, timestamp, &self.provider, &timings).await
+                {
                     Ok(header) => header,
                     Err(err) => {
                         warn!("Failed to get parent header for new slot: {:?}", err);
@@ -199,8 +248,9 @@ where
             );
 
             inc_active_slots();
+            last_processed_block = Some(payload.block());
 
-            let block_ctx = BlockBuildingContext::from_attributes(
+            if let Some(block_ctx) = BlockBuildingContext::from_attributes(
                 payload.payload_attributes_event.clone(),
                 &parent_header,
                 self.coinbase_signer.clone(),
@@ -209,16 +259,18 @@ where
                 Some(payload.suggested_gas_limit),
                 self.extra_data.clone(),
                 None,
-            );
+            ) {
+                builder_pool.start_block_building(
+                    payload,
+                    block_ctx,
+                    self.global_cancellation.clone(),
+                    time_until_slot_end.try_into().unwrap_or_default(),
+                );
 
-            builder_pool.start_block_building(
-                payload,
-                block_ctx,
-                self.global_cancellation.clone(),
-                time_until_slot_end.try_into().unwrap_or_default(),
-            );
-
-            watchdog_sender.try_send(()).unwrap_or_default();
+                if let Some(watchdog_sender) = watchdog_sender.as_ref() {
+                    watchdog_sender.try_send(()).unwrap_or_default();
+                };
+            }
         }
 
         info!("Builder shutting down");
@@ -231,6 +283,17 @@ where
         }
         Ok(())
     }
+
+    // Currently we only need two timings config, depending on whether rbuilder is being
+    // used in the optimism context. If further customisation is required in the future
+    // this should be improved on.
+    fn timings(&self) -> TimingsConfig {
+        if cfg!(feature = "optimism") {
+            TimingsConfig::optimism()
+        } else {
+            TimingsConfig::ethereum()
+        }
+    }
 }
 
 /// May fail if we wait too much (see [BLOCK_HEADER_DEAD_LINE_DELTA])
@@ -238,18 +301,19 @@ async fn wait_for_block_header<P>(
     block: B256,
     slot_time: OffsetDateTime,
     provider: P,
+    timings: &TimingsConfig,
 ) -> eyre::Result<Header>
 where
     P: HeaderProvider,
 {
-    let dead_line = slot_time + BLOCK_HEADER_DEAD_LINE_DELTA;
-    while OffsetDateTime::now_utc() < dead_line {
+    let deadline = slot_time + timings.block_header_deadline_delta;
+    while OffsetDateTime::now_utc() < deadline {
         if let Some(header) = provider.header(&block)? {
             return Ok(header);
         } else {
             let time_to_sleep = min(
-                dead_line - OffsetDateTime::now_utc(),
-                GET_BLOCK_HEADER_PERIOD,
+                deadline - OffsetDateTime::now_utc(),
+                timings.get_block_header_period,
             );
             if time_to_sleep.is_negative() {
                 break;
